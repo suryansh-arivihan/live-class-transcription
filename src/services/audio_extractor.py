@@ -48,37 +48,37 @@ class AudioExtractor:
         logger.info(f"Starting audio extraction from {self.hls_url}")
 
         while self._running:
-            try:
-                async for chunk in self._extract_audio():
-                    yield chunk
-                    # Reset failures on successful read
-                    self._consecutive_failures = 0
-                    retry_delay = self.INITIAL_RETRY_DELAY
+            # try:
+            async for chunk in self._extract_audio():
+                yield chunk
+                # Reset failures on successful read
+                self._consecutive_failures = 0
+                retry_delay = self.INITIAL_RETRY_DELAY
 
-                # Clean exit - stream ended normally
-                logger.info("Audio stream ended gracefully")
-                break
+            # Clean exit - stream ended normally
+            logger.info("Audio stream ended gracefully")
+            break
 
-            except Exception as e:
-                self._consecutive_failures += 1
-                await self.cleanup()
+            # except Exception as e:
+            #     self._consecutive_failures += 1
+            #     await self.cleanup()
 
-                if self._consecutive_failures >= self.MAX_RETRIES:
-                    logger.error(
-                        f"Audio extraction failed after {self.MAX_RETRIES} retries. "
-                        f"Stopping gracefully. Last error: {e}"
-                    )
-                    break
+            #     if self._consecutive_failures >= self.MAX_RETRIES:
+            #         logger.error(
+            #             f"Audio extraction failed after {self.MAX_RETRIES} retries. "
+            #             f"Stopping gracefully. Last error: {e}"
+            #         )
+            #         break
 
-                logger.warning(
-                    f"Audio extraction error (attempt {self._consecutive_failures}/{self.MAX_RETRIES}): {e}. "
-                    f"Retrying in {retry_delay:.1f}s..."
-                )
+            #     logger.warning(
+            #         f"Audio extraction error (attempt {self._consecutive_failures}/{self.MAX_RETRIES}): {e}. "
+            #         f"Retrying in {retry_delay:.1f}s..."
+            #     )
 
-                await asyncio.sleep(retry_delay)
+            #     await asyncio.sleep(retry_delay)
 
-                # Exponential backoff
-                retry_delay = min(retry_delay * self.BACKOFF_MULTIPLIER, self.MAX_RETRY_DELAY)
+            #     # Exponential backoff
+            #     retry_delay = min(retry_delay * self.BACKOFF_MULTIPLIER, self.MAX_RETRY_DELAY)
 
         await self.cleanup()
 
