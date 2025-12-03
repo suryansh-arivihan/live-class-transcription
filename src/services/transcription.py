@@ -51,50 +51,50 @@ class TranscriptionService:
 
         logger.info(f"Starting transcription for stream {self.unique_id}")
 
-        try:
+        # try:
             # Update session status
-            await stream_manager.update_session_status(
-                self.unique_id, StreamStatus.STARTING
-            )
+        await stream_manager.update_session_status(
+            self.unique_id, StreamStatus.STARTING
+        )
 
-            # Initialize components
-            self.audio_extractor = AudioExtractor(self.hls_url)
-            self.soniox_client = SonioxClient()
+        # Initialize components
+        self.audio_extractor = AudioExtractor(self.hls_url)
+        self.soniox_client = SonioxClient()
 
-            # Connect to Soniox
-            await self.soniox_client.connect(self.options)
+        # Connect to Soniox
+        await self.soniox_client.connect(self.options)
 
-            # Update session to active
-            await stream_manager.update_session_status(
-                self.unique_id, StreamStatus.ACTIVE
-            )
+        # Update session to active
+        await stream_manager.update_session_status(
+            self.unique_id, StreamStatus.ACTIVE
+        )
 
-            # Start audio streaming in background task
-            audio_task = asyncio.create_task(self._stream_audio())
+        # Start audio streaming in background task
+        audio_task = asyncio.create_task(self._stream_audio())
 
-            # Iterate over transcription results and yield segments
-            try:
-                async for segment in self._receive_transcriptions():
-                    if not self._running:
-                        break
-                    yield segment
-            finally:
-                # Clean up audio task
-                audio_task.cancel()
-                try:
-                    await audio_task
-                except asyncio.CancelledError:
-                    pass
-
-        except Exception as e:
-            logger.error(f"Transcription error for stream {self.unique_id}: {e}")
-            await stream_manager.update_session_status(
-                self.unique_id, StreamStatus.ERROR, str(e)
-            )
-            raise RuntimeError(f"Transcription failed: {e}")
-
+        # Iterate over transcription results and yield segments
+        try:
+            async for segment in self._receive_transcriptions():
+                if not self._running:
+                    break
+                yield segment
         finally:
-            await self.stop()
+            # Clean up audio task
+            audio_task.cancel()
+            try:
+                await audio_task
+            except asyncio.CancelledError:
+                pass
+
+        # except Exception as e:
+        #     logger.error(f"Transcription error for stream {self.unique_id}: {e}")
+        #     await stream_manager.update_session_status(
+        #         self.unique_id, StreamStatus.ERROR, str(e)
+        #     )
+        #     raise RuntimeError(f"Transcription failed: {e}")
+
+        # finally:
+        #     await self.stop()
 
     async def _stream_audio(self):
         """Stream audio from HLS to Soniox."""
