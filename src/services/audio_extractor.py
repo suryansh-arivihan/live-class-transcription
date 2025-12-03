@@ -92,18 +92,49 @@ class AudioExtractor:
         # Build FFmpeg command
         # Input: HLS stream
         # Output: PCM s16le, mono, 16kHz to stdout
+        # cmd = [
+        #     'ffmpeg',
+        #     '-reconnect', '1',  # Reconnect on network errors
+        #     '-reconnect_streamed', '1',
+        #     '-reconnect_delay_max', '5',
+        #     '-i', self.hls_url,
+        #     '-f', 's16le',
+        #     '-acodec', 'pcm_s16le',
+        #     '-ac', '1',  # mono
+        #     '-ar', str(self.sample_rate),
+        #     '-loglevel', 'error',
+        #     '-'  # output to stdout
+        # ]
+
         cmd = [
             'ffmpeg',
-            '-reconnect', '1',  # Reconnect on network errors
+            '-y',
+            '-hide_banner',
+
+            # Fix: proper reconnect options for HLS
+            '-reconnect', '1',
+            '-reconnect_at_eof', '1',
             '-reconnect_streamed', '1',
             '-reconnect_delay_max', '5',
+
+            # Fix: avoid hangs on ARM / Ubuntu
+            '-timeout', '3000000',
+            '-rw_timeout', '3000000',
+            '-http_seekable', '0',
+            '-flush_packets', '1',
+
             '-i', self.hls_url,
+
+            # Output raw PCM
             '-f', 's16le',
             '-acodec', 'pcm_s16le',
-            '-ac', '1',  # mono
+            '-ac', '1',
             '-ar', str(self.sample_rate),
-            '-loglevel', 'error',
-            '-'  # output to stdout
+
+            # DEBUG: increase log visibility
+            '-loglevel', 'warning',
+
+            '-'
         ]
 
         # Start FFmpeg process
