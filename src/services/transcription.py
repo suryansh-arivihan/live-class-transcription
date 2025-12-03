@@ -98,20 +98,20 @@ class TranscriptionService:
 
     async def _stream_audio(self):
         """Stream audio from HLS to Soniox."""
-        try:
-            logger.info(f"Starting audio streaming for {self.unique_id}")
-            async for audio_chunk in self.audio_extractor.start():
-                if not self._running:
-                    break
-                await self.soniox_client.send_audio(audio_chunk)
+        # try:
+        logger.info(f"Starting audio streaming for {self.unique_id}")
+        async for audio_chunk in self.audio_extractor.start():
+            if not self._running:
+                break
+            await self.soniox_client.send_audio(audio_chunk)
 
-            # Send end-of-stream signal
-            await self.soniox_client.send_eos()
-            logger.info(f"Audio streaming completed for {self.unique_id}")
+        # Send end-of-stream signal
+        await self.soniox_client.send_eos()
+        logger.info(f"Audio streaming completed for {self.unique_id}")
 
-        except Exception as e:
-            logger.error(f"Audio streaming error: {e}")
-            raise
+        # except Exception as e:
+        #     logger.error(f"Audio streaming error: {e}")
+        #     raise
 
     async def _receive_transcriptions(self) -> AsyncGenerator[TranscriptionSegment, None]:
         """Receive and format transcriptions from Soniox."""
