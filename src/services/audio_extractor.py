@@ -107,7 +107,7 @@ class AudioExtractor:
         # ]
 
         cmd = [
-            'ffmpeg',
+            '/usr/bin/ffmpeg',
             '-y',
             '-hide_banner',
 
