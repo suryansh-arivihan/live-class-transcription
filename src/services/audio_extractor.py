@@ -1,6 +1,8 @@
 import asyncio
-import ffmpeg
-from typing import AsyncGenerator, Optional
+import time
+import aiohttp
+import m3u8
+from typing import AsyncGenerator, Optional, Tuple
 from src.config import settings
 from src.utils.logger import setup_logger
 
@@ -10,11 +12,14 @@ logger = setup_logger(__name__)
 class AudioExtractor:
     """Extracts audio from HLS stream and converts to PCM format for transcription."""
 
-    # Retry configuration
+    # Retry configuration (for FFmpeg errors / network failures)
     MAX_RETRIES = 5
     INITIAL_RETRY_DELAY = 1.0  # seconds
     MAX_RETRY_DELAY = 30.0  # seconds
     BACKOFF_MULTIPLIER = 2.0
+
+    # Polling interval when waiting for new HLS segments
+    POLL_INTERVAL = 3.0  # seconds between m3u8 checks
 
     def __init__(self, hls_url: str, sample_rate: int = None):
         """
@@ -30,16 +35,19 @@ class AudioExtractor:
         self._running = False
         self._consecutive_failures = 0
         self._total_bytes_read = 0
+        self._last_media_sequence: Optional[int] = None
 
     async def start(self) -> AsyncGenerator[bytes, None]:
         """
-        Extract audio from HLS stream and yield chunks with exponential backoff retry.
+        Extract audio from HLS stream and yield chunks.
+
+        When the stream goes silent (FFmpeg exits cleanly), polls the m3u8
+        playlist for up to STREAM_RECONNECT_TIMEOUT seconds. If new segments
+        appear the extraction restarts seamlessly; if the timeout is exceeded
+        or the playlist carries #EXT-X-ENDLIST the generator stops.
 
         Yields:
             Audio chunks as bytes in PCM s16le format
-
-        Raises:
-            RuntimeError: If audio extraction fails after all retries
         """
         self._running = True
         self._consecutive_failures = 0
@@ -51,13 +59,22 @@ class AudioExtractor:
             try:
                 async for chunk in self._extract_audio():
                     yield chunk
-                    # Reset failures on successful read
+                    # Reset error counters on successful data
                     self._consecutive_failures = 0
                     retry_delay = self.INITIAL_RETRY_DELAY
 
-                # Clean exit - stream ended normally
-                logger.info("Audio stream ended gracefully")
-                break
+                # FFmpeg exited cleanly — stream went silent.
+                # Poll the m3u8 for new segments before giving up.
+                logger.info(
+                    f"Audio stream went silent. Polling for new HLS segments "
+                    f"(timeout: {settings.STREAM_RECONNECT_TIMEOUT}s)."
+                )
+                should_reconnect = await self._wait_for_new_segments()
+                if not should_reconnect:
+                    # Timed out or permanent end — exit gracefully
+                    break
+                # New segments detected — loop back and restart FFmpeg
+                logger.info("New HLS segments detected, restarting audio extraction.")
 
             except Exception as e:
                 self._consecutive_failures += 1
@@ -74,39 +91,110 @@ class AudioExtractor:
                     f"Audio extraction error (attempt {self._consecutive_failures}/{self.MAX_RETRIES}): {e}. "
                     f"Retrying in {retry_delay:.1f}s..."
                 )
-
                 await asyncio.sleep(retry_delay)
-
-                # Exponential backoff
                 retry_delay = min(retry_delay * self.BACKOFF_MULTIPLIER, self.MAX_RETRY_DELAY)
 
         await self.cleanup()
 
+    async def _wait_for_new_segments(self) -> bool:
+        """
+        Poll the m3u8 playlist until new segments appear or the reconnect
+        timeout is exceeded.
+
+        Returns:
+            True  — new segments found, FFmpeg should restart
+            False — stream permanently ended or reconnect timeout exceeded
+        """
+        timeout = settings.STREAM_RECONNECT_TIMEOUT
+        deadline = time.monotonic() + timeout
+
+        # Snapshot the current sequence so we can detect forward movement
+        self._last_media_sequence = await self._fetch_media_sequence()
+        logger.info(
+            f"Polling {self.hls_url} for new segments every {self.POLL_INTERVAL}s "
+            f"(last sequence: {self._last_media_sequence}, timeout: {timeout}s)"
+        )
+
+        while self._running and time.monotonic() < deadline:
+            await asyncio.sleep(self.POLL_INTERVAL)
+
+            result = await self._fetch_playlist()
+            if result is None:
+                # Transient network error — keep polling
+                continue
+
+            sequence, is_final = result
+
+            if is_final:
+                logger.info("HLS playlist carries #EXT-X-ENDLIST — stream permanently ended.")
+                return False
+
+            if sequence is not None and (
+                self._last_media_sequence is None or sequence > self._last_media_sequence
+            ):
+                logger.info(
+                    f"New segments detected (media_sequence {self._last_media_sequence} → {sequence})."
+                )
+                return True
+
+        if not self._running:
+            return False
+
+        logger.info(f"No new HLS segments after {timeout}s — closing session gracefully.")
+        return False
+
+    async def _fetch_playlist(self) -> Optional[Tuple[Optional[int], bool]]:
+        """
+        Fetch and parse the m3u8 playlist.
+
+        Returns:
+            (media_sequence, is_endlist) tuple, or None on network/parse error.
+        """
+        try:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                async with session.get(
+                    self.hls_url,
+                    timeout=aiohttp.ClientTimeout(total=10)
+                ) as response:
+                    if response.status != 200:
+                        logger.debug(f"m3u8 poll returned HTTP {response.status}")
+                        return None
+
+                    content = await response.text()
+                    playlist = m3u8.loads(content)
+                    return playlist.media_sequence, playlist.is_endlist
+
+        except Exception as e:
+            logger.debug(f"Error polling m3u8: {e}")
+            return None
+
+    async def _fetch_media_sequence(self) -> Optional[int]:
+        """Return the current #EXT-X-MEDIA-SEQUENCE from the playlist."""
+        result = await self._fetch_playlist()
+        return result[0] if result else None
+
     async def _extract_audio(self) -> AsyncGenerator[bytes, None]:
         """
-        Internal method to extract audio from HLS stream.
+        Internal method to extract audio from HLS stream via FFmpeg.
 
         Yields:
             Audio chunks as bytes in PCM s16le format
         """
-        # Build FFmpeg command
-        # Input: HLS stream
-        # Output: PCM s16le, mono, 16kHz to stdout
         cmd = [
             'ffmpeg',
-            '-reconnect', '1',  # Reconnect on network errors
+            '-reconnect', '1',
             '-reconnect_streamed', '1',
             '-reconnect_delay_max', '5',
             '-i', self.hls_url,
             '-f', 's16le',
             '-acodec', 'pcm_s16le',
-            '-ac', '1',  # mono
+            '-ac', '1',       # mono
             '-ar', str(self.sample_rate),
             '-loglevel', 'error',
-            '-'  # output to stdout
+            '-'               # output to stdout
         ]
 
-        # Start FFmpeg process
         self.process = await asyncio.create_subprocess_exec(
             *cmd,
             stdout=asyncio.subprocess.PIPE,
@@ -115,31 +203,27 @@ class AudioExtractor:
 
         logger.info("FFmpeg process started successfully")
 
-        # Read audio chunks from stdout
         chunk_size = settings.AUDIO_CHUNK_SIZE
         empty_read_count = 0
-        max_empty_reads = 10  # Allow some empty reads before considering stream ended
+        max_empty_reads = 10
 
         while self._running:
             try:
                 chunk = await asyncio.wait_for(
                     self.process.stdout.read(chunk_size),
-                    timeout=30.0  # 30 second timeout for each read
+                    timeout=30.0
                 )
 
                 if not chunk:
                     empty_read_count += 1
                     if empty_read_count >= max_empty_reads:
-                        # Check if process is still running
                         if self.process.returncode is not None:
                             stderr = await self.process.stderr.read()
                             if stderr:
                                 logger.warning(f"FFmpeg stderr: {stderr.decode()}")
                             logger.info("End of audio stream reached (process exited)")
                             return
-                        # Process still running but no data - might be buffering
                         await asyncio.sleep(0.1)
-                        continue
                     continue
 
                 empty_read_count = 0

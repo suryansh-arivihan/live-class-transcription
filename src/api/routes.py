@@ -114,8 +114,8 @@ async def start_transcription(request: TranscriptionStartRequest):
         task = asyncio.create_task(_run_transcription(transcription_service, session.session_id))
         await stream_manager.set_session_task(unique_id, task)
 
-        # Build stream URL
-        stream_url = f"ws://{settings.HOST}:{settings.PORT}/api/v1/ws/transcribe/{unique_id}"
+        # Build stream URL using PUBLIC_HOST (not the bind address)
+        stream_url = f"ws://{settings.PUBLIC_HOST}:{settings.PORT}/api/v1/ws/transcribe/{unique_id}"
 
         logger.info(f"Started transcription session {session.session_id} for {unique_id}")
 

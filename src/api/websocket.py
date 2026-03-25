@@ -34,6 +34,7 @@ async def websocket_transcribe(websocket: WebSocket, unique_id: str):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
 
+    queue = None
     try:
         # Check if session exists
         session = await stream_manager.get_session(unique_id)
@@ -92,7 +93,8 @@ async def websocket_transcribe(websocket: WebSocket, unique_id: str):
 
     finally:
         # Unregister queue and remove client from session
-        await stream_manager.unregister_queue(unique_id, queue)
+        if queue is not None:
+            await stream_manager.unregister_queue(unique_id, queue)
         await stream_manager.remove_client(unique_id, websocket)
         try:
             await websocket.close()

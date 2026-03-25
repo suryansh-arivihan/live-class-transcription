@@ -13,12 +13,14 @@ class Settings(BaseSettings):
     # Server Configuration
     HOST: str = "0.0.0.0"
     PORT: int = 8000
+    PUBLIC_HOST: str = "localhost"  # Advertised host returned to clients (not the bind address)
     WORKERS: int = 4
 
     # Stream Configuration
     RTMP_BASE_URL: str = "https://antmedia.arivihan.com:5443/LiveApp/streams"
     MAX_CONCURRENT_STREAMS: int = 10
     STREAM_TIMEOUT: int = 300  # seconds
+    STREAM_RECONNECT_TIMEOUT: int = 120  # seconds to poll for new HLS segments before closing session
 
     # Soniox Configuration
     SONIOX_API_KEY: str

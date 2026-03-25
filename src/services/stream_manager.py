@@ -108,24 +108,27 @@ class StreamSessionManager:
             unique_id: Stream unique identifier
         """
         async with self._lock:
-            if unique_id in self.active_sessions:
-                session = self.active_sessions.pop(unique_id)
+            if unique_id not in self.active_sessions:
+                return
 
-                # Cancel associated task if exists
-                if unique_id in self.session_tasks:
-                    task = self.session_tasks.pop(unique_id)
-                    if not task.done():
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
+            session = self.active_sessions.pop(unique_id)
+            task = self.session_tasks.pop(unique_id, None)
 
-                # Remove clients
-                if unique_id in self.session_clients:
-                    self.session_clients.pop(unique_id)
+            # Remove clients and queues
+            self.session_clients.pop(unique_id, None)
+            self.session_queues.pop(unique_id, None)
 
-                logger.info(f"Removed session {session.session_id} for stream {unique_id}")
+        # Cancel task AFTER releasing the lock to prevent deadlock:
+        # the task's finally block also calls remove_session, which would
+        # try to re-acquire the lock causing a permanent deadlock.
+        if task and not task.done():
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        logger.info(f"Removed session {session.session_id} for stream {unique_id}")
 
     async def set_session_task(self, unique_id: str, task: asyncio.Task):
         """
