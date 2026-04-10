@@ -1,4 +1,5 @@
 import asyncio
+import time
 import uuid
 from datetime import datetime
 from typing import AsyncGenerator, Optional
@@ -8,9 +9,11 @@ from src.models.transcription import (
     StreamOptions
 )
 from src.models.stream import StreamStatus
-from src.services.audio_extractor import AudioExtractor
+from src.services.audio_extractor import AudioExtractor, fetch_hls_playlist
 from src.services.soniox_client import SonioxClient
 from src.services.stream_manager import stream_manager
+from src.services.dynamodb_client import dynamodb_client
+from src.config import settings
 from src.utils.logger import setup_logger
 
 logger = setup_logger(__name__)
@@ -24,7 +27,7 @@ class TranscriptionService:
         Initialize transcription service.
 
         Args:
-            unique_id: Unique stream identifier
+            unique_id: Unique stream identifier (maps to roomId in DynamoDB)
             hls_url: HLS stream URL
             options: Transcription options
         """
@@ -38,7 +41,11 @@ class TranscriptionService:
 
     async def start(self) -> AsyncGenerator[TranscriptionSegment, None]:
         """
-        Start transcription pipeline.
+        Start transcription pipeline with automatic reconnection.
+
+        When the audio stream goes silent and the HLS reconnect timeout expires,
+        the service enters a WAITING state and polls DynamoDB for a session-end
+        signal. If the stream resumes, a fresh pipeline cycle is started.
 
         Yields:
             TranscriptionSegment objects with transcribed text
@@ -52,39 +59,77 @@ class TranscriptionService:
         logger.info(f"Starting transcription for stream {self.unique_id}")
 
         try:
-            # Update session status
             await stream_manager.update_session_status(
                 self.unique_id, StreamStatus.STARTING
             )
 
-            # Initialize components
-            self.audio_extractor = AudioExtractor(self.hls_url)
-            self.soniox_client = SonioxClient()
+            while self._running:
+                # --- Pipeline cycle: fresh components each time ---
+                self.audio_extractor = AudioExtractor(self.hls_url, reconnect_timeout=0)
+                self.soniox_client = SonioxClient()
 
-            # Connect to Soniox
-            await self.soniox_client.connect(self.options)
-
-            # Update session to active
-            await stream_manager.update_session_status(
-                self.unique_id, StreamStatus.ACTIVE
-            )
-
-            # Start audio streaming in background task
-            audio_task = asyncio.create_task(self._stream_audio())
-
-            # Iterate over transcription results and yield segments
-            try:
-                async for segment in self._receive_transcriptions():
-                    if not self._running:
-                        break
-                    yield segment
-            finally:
-                # Clean up audio task
-                audio_task.cancel()
+                pipeline_error = False
                 try:
-                    await audio_task
-                except asyncio.CancelledError:
-                    pass
+                    await self.soniox_client.connect(self.options)
+                    await stream_manager.update_session_status(
+                        self.unique_id, StreamStatus.ACTIVE
+                    )
+
+                    audio_task = asyncio.create_task(self._stream_audio())
+
+                    try:
+                        async for segment in self._receive_transcriptions():
+                            if not self._running:
+                                break
+                            yield segment
+                    finally:
+                        audio_task.cancel()
+                        try:
+                            await audio_task
+                        except asyncio.CancelledError:
+                            pass
+
+                except Exception as e:
+                    # Pipeline cycle failed (e.g. no audio reached Soniox,
+                    # connection lost, etc.) — don't crash the session,
+                    # fall through to WAITING state.
+                    logger.warning(
+                        f"Pipeline cycle failed for {self.unique_id}: {e}. "
+                        f"Will poll for session end or stream resume."
+                    )
+                    pipeline_error = True
+
+                # --- Pipeline ended (stream went silent or errored) ---
+                # Clean up current cycle's resources
+                if self.audio_extractor:
+                    await self.audio_extractor.stop()
+                if self.soniox_client:
+                    await self.soniox_client.disconnect()
+
+                if not self._running:
+                    break
+
+                # --- Wait for session end or stream resume ---
+                await stream_manager.update_session_status(
+                    self.unique_id, StreamStatus.WAITING
+                )
+                logger.info(
+                    f"Stream silent for {self.unique_id}. "
+                    f"Polling for session end or stream resume."
+                )
+
+                result = await self._wait_for_session_end_or_resume()
+
+                if result == "resumed":
+                    logger.info(
+                        f"Stream resumed for {self.unique_id}, restarting pipeline."
+                    )
+                    continue
+                else:
+                    logger.info(
+                        f"Session ended for {self.unique_id} (reason: {result})."
+                    )
+                    break
 
         except Exception as e:
             logger.error(f"Transcription error for stream {self.unique_id}: {e}")
@@ -95,6 +140,72 @@ class TranscriptionService:
 
         finally:
             await self.stop()
+
+    async def _wait_for_session_end_or_resume(self) -> str:
+        """
+        Poll DynamoDB and m3u8 until either the session has ended or the
+        stream has resumed.
+
+        Stream resume is detected by observing the media sequence advance
+        between two consecutive polls, which means the HLS stream is actively
+        producing new segments — regardless of whether the sequence number is
+        higher or lower than the previous session's last known value.
+
+        Returns:
+            "ended"   — session-end entry found in DynamoDB
+            "resumed" — new HLS segments detected (sequence advancing)
+            "timeout" — safety timeout exceeded
+        """
+        deadline = time.monotonic() + settings.SESSION_END_POLL_TIMEOUT
+        poll_interval = settings.SESSION_END_POLL_INTERVAL
+
+        # Track the sequence seen on the *previous* poll iteration so we can
+        # detect forward movement (i.e. new segments being produced right now).
+        prev_poll_sequence: Optional[int] = None
+
+        logger.info(
+            f"Polling every {poll_interval}s for session end "
+            f"(timeout: {settings.SESSION_END_POLL_TIMEOUT}s) "
+            f"for {self.unique_id}"
+        )
+
+        while self._running and time.monotonic() < deadline:
+            # Check DynamoDB for session-end signal
+            ended = await dynamodb_client.check_session_ended(self.unique_id)
+            if ended:
+                logger.info(
+                    f"Session-end entry found in DynamoDB for {self.unique_id}."
+                )
+                return "ended"
+
+            # Check m3u8 for stream resume by detecting sequence advancement
+            result = await fetch_hls_playlist(self.hls_url)
+            if result is not None:
+                sequence, is_final = result
+                if not is_final and sequence is not None:
+                    if prev_poll_sequence is not None and sequence > prev_poll_sequence:
+                        logger.info(
+                            f"Stream resumed for {self.unique_id} — "
+                            f"HLS sequence advancing "
+                            f"({prev_poll_sequence} → {sequence})."
+                        )
+                        return "resumed"
+                    prev_poll_sequence = sequence
+            else:
+                # Playlist not reachable — reset so we need two consecutive
+                # successful polls to confirm the stream is truly back.
+                prev_poll_sequence = None
+
+            await asyncio.sleep(poll_interval)
+
+        if not self._running:
+            return "stopped"
+
+        logger.warning(
+            f"Session-end poll timeout ({settings.SESSION_END_POLL_TIMEOUT}s) "
+            f"exceeded for {self.unique_id}."
+        )
+        return "timeout"
 
     async def _stream_audio(self):
         """Stream audio from HLS to Soniox."""
@@ -122,7 +233,6 @@ class TranscriptionService:
                 if not self._running:
                     break
 
-                # Process tokens from Soniox response
                 segment = self._format_transcription(result)
                 if segment:
                     yield segment
@@ -147,7 +257,6 @@ class TranscriptionService:
         if not tokens:
             return None
 
-        # Extract words
         words = []
         text_parts = []
         is_final = False
@@ -159,11 +268,9 @@ class TranscriptionService:
 
             text_parts.append(token_text)
 
-            # Check if any token is final
             if token.get("is_final"):
                 is_final = True
 
-            # Create Word object
             word = Word(
                 text=token_text,
                 start_time=token.get("start_time", 0.0),
@@ -177,12 +284,10 @@ class TranscriptionService:
         if not text_parts:
             return None
 
-        # Calculate stream time
         stream_time = 0.0
         if self._start_time:
             stream_time = (datetime.utcnow() - self._start_time).total_seconds()
 
-        # Create segment
         segment = TranscriptionSegment(
             unique_id=self.unique_id,
             segment_id=str(uuid.uuid4()),
@@ -201,15 +306,12 @@ class TranscriptionService:
         logger.info(f"Stopping transcription for stream {self.unique_id}")
         self._running = False
 
-        # Cleanup audio extractor
         if self.audio_extractor:
             await self.audio_extractor.stop()
 
-        # Cleanup Soniox client
         if self.soniox_client:
             await self.soniox_client.disconnect()
 
-        # Update session status
         await stream_manager.update_session_status(
             self.unique_id, StreamStatus.STOPPED
         )

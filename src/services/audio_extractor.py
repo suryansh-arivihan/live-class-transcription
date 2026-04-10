@@ -9,6 +9,32 @@ from src.utils.logger import setup_logger
 logger = setup_logger(__name__)
 
 
+async def fetch_hls_playlist(hls_url: str) -> Optional[Tuple[Optional[int], bool]]:
+    """
+    Fetch media_sequence and is_endlist from an HLS m3u8 playlist URL.
+
+    Args:
+        hls_url: URL to the m3u8 playlist
+
+    Returns:
+        (media_sequence, is_endlist) tuple, or None on error
+    """
+    try:
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            async with session.get(
+                hls_url,
+                timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status != 200:
+                    return None
+                content = await response.text()
+                playlist = m3u8.loads(content)
+                return playlist.media_sequence, playlist.is_endlist
+    except Exception:
+        return None
+
+
 class AudioExtractor:
     """Extracts audio from HLS stream and converts to PCM format for transcription."""
 
@@ -21,16 +47,20 @@ class AudioExtractor:
     # Polling interval when waiting for new HLS segments
     POLL_INTERVAL = 3.0  # seconds between m3u8 checks
 
-    def __init__(self, hls_url: str, sample_rate: int = None):
+    def __init__(self, hls_url: str, sample_rate: int = None, reconnect_timeout: Optional[int] = None):
         """
         Initialize audio extractor.
 
         Args:
             hls_url: URL to HLS stream
             sample_rate: Target sample rate (defaults to settings)
+            reconnect_timeout: Seconds to poll m3u8 for new segments when
+                stream goes silent. Defaults to settings.STREAM_RECONNECT_TIMEOUT.
+                Pass 0 to skip the reconnect wait entirely.
         """
         self.hls_url = hls_url
         self.sample_rate = sample_rate or settings.SONIOX_SAMPLE_RATE
+        self.reconnect_timeout = reconnect_timeout if reconnect_timeout is not None else settings.STREAM_RECONNECT_TIMEOUT
         self.process: Optional[asyncio.subprocess.Process] = None
         self._running = False
         self._consecutive_failures = 0
@@ -64,10 +94,15 @@ class AudioExtractor:
                     retry_delay = self.INITIAL_RETRY_DELAY
 
                 # FFmpeg exited cleanly — stream went silent.
+                if self.reconnect_timeout <= 0:
+                    # Caller handles reconnection at a higher level
+                    logger.info("Audio stream went silent. Exiting (reconnect handled externally).")
+                    break
+
                 # Poll the m3u8 for new segments before giving up.
                 logger.info(
                     f"Audio stream went silent. Polling for new HLS segments "
-                    f"(timeout: {settings.STREAM_RECONNECT_TIMEOUT}s)."
+                    f"(timeout: {self.reconnect_timeout}s)."
                 )
                 should_reconnect = await self._wait_for_new_segments()
                 if not should_reconnect:
@@ -105,7 +140,7 @@ class AudioExtractor:
             True  — new segments found, FFmpeg should restart
             False — stream permanently ended or reconnect timeout exceeded
         """
-        timeout = settings.STREAM_RECONNECT_TIMEOUT
+        timeout = self.reconnect_timeout
         deadline = time.monotonic() + timeout
 
         # Snapshot the current sequence so we can detect forward movement
@@ -186,6 +221,9 @@ class AudioExtractor:
             '-reconnect', '1',
             '-reconnect_streamed', '1',
             '-reconnect_delay_max', '5',
+            '-f', 'hls',
+            '-allowed_extensions', 'ALL',
+            '-extension_picky', '0',
             '-i', self.hls_url,
             '-f', 's16le',
             '-acodec', 'pcm_s16le',

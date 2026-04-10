@@ -9,6 +9,7 @@ class StreamStatus(str, Enum):
     PENDING = "pending"
     STARTING = "starting"
     ACTIVE = "active"
+    WAITING = "waiting"
     STOPPING = "stopping"
     STOPPED = "stopped"
     ERROR = "error"

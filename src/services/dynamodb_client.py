@@ -35,14 +35,19 @@ class DynamoDBClient:
         self._client = None
         self._table = None
 
-    def _get_client(self):
-        """Get or create DynamoDB client."""
+    def _get_resource(self):
+        """Get or create DynamoDB resource."""
         if self._client is None:
             self._client = boto3.resource(
                 'dynamodb',
                 region_name=self.region
             )
             self._table = self._client.Table(self.table_name)
+        return self._client
+
+    def _get_client(self):
+        """Get or create DynamoDB table reference."""
+        self._get_resource()
         return self._table
 
     async def save_chunk(
@@ -142,6 +147,35 @@ class DynamoDBClient:
         except Exception as e:
             logger.error(f"Failed to query chunks: {e}")
             return []
+
+    async def check_session_ended(self, room_id: str) -> bool:
+        """
+        Check if a session-end entry exists for this roomId in the
+        live-chat-session-ends DynamoDB table.
+
+        Args:
+            room_id: The room/stream identifier (unique_id)
+
+        Returns:
+            True if a session-end entry exists, False otherwise
+        """
+        try:
+            loop = asyncio.get_event_loop()
+            return await loop.run_in_executor(
+                _executor,
+                self._check_session_ended_sync,
+                room_id
+            )
+        except Exception as e:
+            logger.error(f"Error checking session end for {room_id}: {e}")
+            return False
+
+    def _check_session_ended_sync(self, room_id: str) -> bool:
+        """Synchronous session-end check for thread executor."""
+        resource = self._get_resource()
+        table = resource.Table(settings.SESSION_ENDS_TABLE_NAME)
+        response = table.get_item(Key={"roomId": room_id})
+        return "Item" in response
 
     def _query_by_stream(
         self,

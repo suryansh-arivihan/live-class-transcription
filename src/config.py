@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     MAX_CONCURRENT_STREAMS: int = 10
     STREAM_TIMEOUT: int = 300  # seconds
     STREAM_RECONNECT_TIMEOUT: int = 120  # seconds to poll for new HLS segments before closing session
+    SESSION_END_POLL_INTERVAL: int = 10  # seconds between DynamoDB session-end checks
+    SESSION_END_POLL_TIMEOUT: int = 3600  # max seconds to wait for session end signal (safety net)
+    SESSION_ENDS_TABLE_NAME: str = "live-chat-session-ends"  # DynamoDB table for session-end entries
 
     # Soniox Configuration
     SONIOX_API_KEY: str
