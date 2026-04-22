@@ -1,3 +1,4 @@
+import asyncio
 import websockets
 import json
 from typing import AsyncGenerator, Dict, Any, Optional
@@ -23,6 +24,7 @@ class SonioxClient:
         self.ws_url = ws_url or settings.SONIOX_WS_URL
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self._connected = False
+        self._buffered_message: Optional[str] = None
 
     async def connect(self, options: StreamOptions):
         """
@@ -75,14 +77,50 @@ class SonioxClient:
 
             # Send configuration
             await self.websocket.send(json.dumps(config))
-            self._connected = True
 
+            # Soniox validates the API key only after the config frame is sent
+            # and reports rejection as a JSON frame (not a WS close), so the
+            # connect() path looks successful otherwise. Peek once for an early
+            # error so auth failures surface here and the caller's fallback
+            # path can trigger.
+            await self._verify_config_accepted()
+
+            self._connected = True
             logger.info("Connected to Soniox WebSocket successfully")
 
         except Exception as e:
             logger.error(f"Failed to connect to Soniox: {e}")
             self._connected = False
             raise ConnectionError(f"Failed to connect to Soniox: {e}")
+
+    async def _verify_config_accepted(self):
+        """Wait briefly for a config-reject frame from Soniox.
+
+        Timeout means the config was accepted (Soniox stays silent until audio
+        arrives). A frame with error_code means the config was rejected.
+        Anything else is buffered so receive_transcriptions can yield it.
+        """
+        try:
+            message = await asyncio.wait_for(
+                self.websocket.recv(),
+                timeout=settings.SONIOX_CONNECT_VERIFY_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            return
+
+        try:
+            data = json.loads(message)
+        except json.JSONDecodeError:
+            self._buffered_message = message
+            return
+
+        if data.get("error_code"):
+            raise RuntimeError(
+                f"Soniox rejected config: {data.get('error_code')} - "
+                f"{data.get('error_message')}"
+            )
+
+        self._buffered_message = message
 
     async def send_audio(self, audio_chunk: bytes):
         """
@@ -128,8 +166,15 @@ class SonioxClient:
 
         logger.info("Starting to receive transcriptions")
 
-        try:
+        async def _stream():
+            if self._buffered_message is not None:
+                buffered, self._buffered_message = self._buffered_message, None
+                yield buffered
             async for message in self.websocket:
+                yield message
+
+        try:
+            async for message in _stream():
                 try:
                     data = json.loads(message)
 

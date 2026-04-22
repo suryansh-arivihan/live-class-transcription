@@ -10,3 +10,4 @@ pydantic-settings==2.1.0
 python-dotenv==1.0.0
 python-multipart==0.0.6
 boto3>=1.28.0
+amazon-transcribe>=0.6.2

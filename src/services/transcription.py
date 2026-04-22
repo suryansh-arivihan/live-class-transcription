@@ -2,7 +2,7 @@ import asyncio
 import time
 import uuid
 from datetime import datetime
-from typing import AsyncGenerator, Optional
+from typing import AsyncGenerator, Optional, Union
 from src.models.transcription import (
     TranscriptionSegment,
     Word,
@@ -11,6 +11,7 @@ from src.models.transcription import (
 from src.models.stream import StreamStatus
 from src.services.audio_extractor import AudioExtractor, fetch_hls_playlist
 from src.services.soniox_client import SonioxClient
+from src.services.aws_transcribe_client import AwsTranscribeClient
 from src.services.stream_manager import stream_manager
 from src.services.dynamodb_client import dynamodb_client
 from src.config import settings
@@ -35,7 +36,7 @@ class TranscriptionService:
         self.hls_url = hls_url
         self.options = options
         self.audio_extractor: Optional[AudioExtractor] = None
-        self.soniox_client: Optional[SonioxClient] = None
+        self.stt_client: Optional[Union[SonioxClient, AwsTranscribeClient]] = None
         self._running = False
         self._start_time: Optional[datetime] = None
 
@@ -66,11 +67,10 @@ class TranscriptionService:
             while self._running:
                 # --- Pipeline cycle: fresh components each time ---
                 self.audio_extractor = AudioExtractor(self.hls_url, reconnect_timeout=0)
-                self.soniox_client = SonioxClient()
+                self.stt_client = await self._connect_stt_with_fallback()
 
                 pipeline_error = False
                 try:
-                    await self.soniox_client.connect(self.options)
                     await stream_manager.update_session_status(
                         self.unique_id, StreamStatus.ACTIVE
                     )
@@ -103,8 +103,8 @@ class TranscriptionService:
                 # Clean up current cycle's resources
                 if self.audio_extractor:
                     await self.audio_extractor.stop()
-                if self.soniox_client:
-                    await self.soniox_client.disconnect()
+                if self.stt_client:
+                    await self.stt_client.disconnect()
 
                 if not self._running:
                     break
@@ -207,17 +207,41 @@ class TranscriptionService:
         )
         return "timeout"
 
+    async def _connect_stt_with_fallback(self) -> Union[SonioxClient, AwsTranscribeClient]:
+        """
+        Try Soniox first; fall back to AWS Transcribe on connect failure.
+        Fallback is per-cycle (non-sticky): next cycle retries Soniox.
+        """
+        soniox = SonioxClient()
+        try:
+            await soniox.connect(self.options)
+            return soniox
+        except Exception as e:
+            logger.warning(
+                f"Soniox connect failed for {self.unique_id}: {e}. "
+                f"Falling back to AWS Transcribe."
+            )
+            try:
+                await soniox.disconnect()
+            except Exception:
+                pass
+
+            aws = AwsTranscribeClient()
+            await aws.connect(self.options)
+            logger.info(f"Using AWS Transcribe fallback for {self.unique_id}")
+            return aws
+
     async def _stream_audio(self):
-        """Stream audio from HLS to Soniox."""
+        """Stream audio from HLS to the active STT client."""
         try:
             logger.info(f"Starting audio streaming for {self.unique_id}")
             async for audio_chunk in self.audio_extractor.start():
                 if not self._running:
                     break
-                await self.soniox_client.send_audio(audio_chunk)
+                await self.stt_client.send_audio(audio_chunk)
 
             # Send end-of-stream signal
-            await self.soniox_client.send_eos()
+            await self.stt_client.send_eos()
             logger.info(f"Audio streaming completed for {self.unique_id}")
 
         except Exception as e:
@@ -225,11 +249,11 @@ class TranscriptionService:
             raise
 
     async def _receive_transcriptions(self) -> AsyncGenerator[TranscriptionSegment, None]:
-        """Receive and format transcriptions from Soniox."""
+        """Receive and format transcriptions from the active STT client."""
         try:
             logger.info(f"Starting transcription reception for {self.unique_id}")
 
-            async for result in self.soniox_client.receive_transcriptions():
+            async for result in self.stt_client.receive_transcriptions():
                 if not self._running:
                     break
 
@@ -245,13 +269,10 @@ class TranscriptionService:
 
     def _format_transcription(self, result: dict) -> Optional[TranscriptionSegment]:
         """
-        Format Soniox transcription result into TranscriptionSegment.
+        Format a token-bearing STT result into TranscriptionSegment.
 
-        Args:
-            result: Raw result from Soniox
-
-        Returns:
-            TranscriptionSegment or None if no valid tokens
+        Accepts the Soniox token shape; AwsTranscribeClient emits the same
+        shape so the active provider is transparent here.
         """
         tokens = result.get("tokens", [])
         if not tokens:
@@ -309,8 +330,8 @@ class TranscriptionService:
         if self.audio_extractor:
             await self.audio_extractor.stop()
 
-        if self.soniox_client:
-            await self.soniox_client.disconnect()
+        if self.stt_client:
+            await self.stt_client.disconnect()
 
         await stream_manager.update_session_status(
             self.unique_id, StreamStatus.STOPPED

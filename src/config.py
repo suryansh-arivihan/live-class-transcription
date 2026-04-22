@@ -30,6 +30,13 @@ class Settings(BaseSettings):
     SONIOX_WS_URL: str = "wss://stt-rt.soniox.com/transcribe-websocket"
     SONIOX_SAMPLE_RATE: int = 16000
     SONIOX_MODEL: str = "stt-rt-v3"
+    SONIOX_CONNECT_VERIFY_TIMEOUT: float = 2.0  # seconds to wait for config-reject frame after connect
+
+    # AWS Transcribe Configuration (fallback)
+    AWS_TRANSCRIBE_REGION: Optional[str] = None  # defaults to AWS_REGION if unset
+    AWS_TRANSCRIBE_LANGUAGE_CODE: str = "hi-IN"
+    AWS_TRANSCRIBE_SAMPLE_RATE: int = 16000
+    AWS_TRANSCRIBE_MEDIA_ENCODING: str = "pcm"
 
     # Audio Configuration
     AUDIO_CHUNK_SIZE: int = 8000  # 0.5 seconds at 16kHz

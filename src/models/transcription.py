@@ -27,7 +27,8 @@ class TranscriptionSegment(BaseModel):
 
 class StreamOptions(BaseModel):
     """Configuration options for transcription stream."""
-    language: str = "en-US"
+    # None → provider picks up its configured default (e.g. AWS_TRANSCRIBE_LANGUAGE_CODE).
+    language: Optional[str] = None
     include_word_timestamps: bool = True
     vocabulary: List[str] = []
     enable_punctuation: bool = True
@@ -35,7 +36,7 @@ class StreamOptions(BaseModel):
     enable_language_identification: bool = False
     enable_speaker_diarization: bool = False
     enable_endpoint_detection: bool = True
-    language_hints: List[str] = ["en"]
+    language_hints: List[str] = ["hi", "en"]
 
 
 class TranscriptionStartRequest(BaseModel):
