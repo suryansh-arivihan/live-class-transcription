@@ -4,7 +4,7 @@ from typing import Dict, Optional, Set
 from datetime import datetime
 from src.models.stream import StreamSession, StreamStatus, StreamInfo
 from src.config import settings
-from src.utils.logger import setup_logger
+from src.utils.logger import setup_logger, set_log_context
 
 logger = setup_logger(__name__)
 
@@ -48,6 +48,14 @@ class StreamSessionManager:
 
             # Check concurrent limit
             if len(self.active_sessions) >= self.max_concurrent:
+                logger.warning(
+                    "Maximum concurrent streams reached",
+                    extra={
+                        "unique_id": unique_id,
+                        "max_concurrent": self.max_concurrent,
+                        "active_sessions": len(self.active_sessions),
+                    },
+                )
                 raise RuntimeError(
                     f"Maximum concurrent streams reached ({self.max_concurrent})"
                 )
@@ -64,7 +72,15 @@ class StreamSessionManager:
             self.active_sessions[unique_id] = session
             self.session_clients[unique_id] = set()
 
-            logger.info(f"Created session {session.session_id} for stream {unique_id}")
+            logger.info(
+                "Session created",
+                extra={
+                    "unique_id": unique_id,
+                    "session_id": session.session_id,
+                    "hls_url": hls_url,
+                    "active_sessions": len(self.active_sessions),
+                },
+            )
             return session
 
     async def get_session(self, unique_id: str) -> Optional[StreamSession]:
@@ -92,13 +108,23 @@ class StreamSessionManager:
         """
         session = self.active_sessions.get(unique_id)
         if session:
+            old_status = session.status
             session.status = status
             if error:
                 session.error = error
             if status in [StreamStatus.STOPPED, StreamStatus.ERROR]:
                 session.stopped_at = datetime.utcnow()
 
-            logger.info(f"Session {unique_id} status updated to {status}")
+            logger.info(
+                "Session status updated",
+                extra={
+                    "unique_id": unique_id,
+                    "session_id": session.session_id,
+                    "old_status": str(old_status),
+                    "new_status": str(status),
+                    "error": error,
+                },
+            )
 
     async def remove_session(self, unique_id: str):
         """
@@ -128,7 +154,14 @@ class StreamSessionManager:
             except (asyncio.CancelledError, Exception):
                 pass
 
-        logger.info(f"Removed session {session.session_id} for stream {unique_id}")
+        logger.info(
+            "Session removed",
+            extra={
+                "unique_id": unique_id,
+                "session_id": session.session_id,
+                "remaining_sessions": len(self.active_sessions),
+            },
+        )
 
     async def set_session_task(self, unique_id: str, task: asyncio.Task):
         """
@@ -151,8 +184,11 @@ class StreamSessionManager:
         if unique_id in self.session_clients:
             self.session_clients[unique_id].add(client)
             logger.info(
-                f"Client added to session {unique_id}. "
-                f"Total clients: {len(self.session_clients[unique_id])}"
+                "Client added to session",
+                extra={
+                    "unique_id": unique_id,
+                    "total_clients": len(self.session_clients[unique_id]),
+                },
             )
 
     async def remove_client(self, unique_id: str, client):
@@ -166,8 +202,11 @@ class StreamSessionManager:
         if unique_id in self.session_clients:
             self.session_clients[unique_id].discard(client)
             logger.info(
-                f"Client removed from session {unique_id}. "
-                f"Remaining clients: {len(self.session_clients[unique_id])}"
+                "Client removed from session",
+                extra={
+                    "unique_id": unique_id,
+                    "remaining_clients": len(self.session_clients[unique_id]),
+                },
             )
 
     async def get_client_count(self, unique_id: str) -> int:
@@ -197,7 +236,13 @@ class StreamSessionManager:
 
         queue = asyncio.Queue()
         self.session_queues[unique_id].append(queue)
-        logger.info(f"Registered new queue for session {unique_id}")
+        logger.info(
+            "Queue registered for session",
+            extra={
+                "unique_id": unique_id,
+                "total_queues": len(self.session_queues[unique_id]),
+            },
+        )
         return queue
 
     async def unregister_queue(self, unique_id: str, queue: asyncio.Queue):
@@ -211,7 +256,13 @@ class StreamSessionManager:
         if unique_id in self.session_queues:
             try:
                 self.session_queues[unique_id].remove(queue)
-                logger.info(f"Unregistered queue from session {unique_id}")
+                logger.info(
+                    "Queue unregistered from session",
+                    extra={
+                        "unique_id": unique_id,
+                        "remaining_queues": len(self.session_queues[unique_id]),
+                    },
+                )
             except ValueError:
                 pass
 
@@ -228,7 +279,10 @@ class StreamSessionManager:
                 try:
                     await queue.put(segment)
                 except Exception as e:
-                    logger.error(f"Error broadcasting segment to queue: {e}")
+                    logger.exception(
+                        "Error broadcasting segment to queue",
+                        extra={"unique_id": unique_id, "error": str(e)},
+                    )
 
     async def get_all_sessions(self) -> list[StreamInfo]:
         """
@@ -257,10 +311,14 @@ class StreamSessionManager:
 
     async def cleanup_all(self):
         """Clean up all active sessions."""
-        logger.info("Cleaning up all active sessions")
+        logger.info(
+            "Cleaning up all active sessions",
+            extra={"active_sessions": len(self.active_sessions)},
+        )
         unique_ids = list(self.active_sessions.keys())
         for unique_id in unique_ids:
             await self.remove_session(unique_id)
+        logger.info("All sessions cleaned up")
 
 
 # Global stream manager instance

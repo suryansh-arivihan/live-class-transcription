@@ -103,13 +103,44 @@ class DynamoDBClient:
                 self._put_item,
                 item
             )
-            logger.info(f"Saved chunk {chunk_id} for stream {stream_id} at {chunk_timestamp}")
+            logger.info(
+                "Chunk saved to DynamoDB",
+                extra={
+                    "stream_id": stream_id,
+                    "session_id": session_id,
+                    "chunk_id": chunk_id,
+                    "chunk_timestamp": chunk_timestamp,
+                    "start_time": float(start_time),
+                    "end_time": float(end_time),
+                    "word_count": len(words),
+                    "text_length": len(text) if text else 0,
+                    "table": self.table_name,
+                },
+            )
             return True
         except ClientError as e:
-            logger.error(f"Failed to save chunk to DynamoDB: {e}")
+            logger.error(
+                "DynamoDB ClientError when saving chunk",
+                extra={
+                    "stream_id": stream_id,
+                    "session_id": session_id,
+                    "chunk_id": chunk_id,
+                    "error_code": e.response.get("Error", {}).get("Code"),
+                    "error_message": e.response.get("Error", {}).get("Message"),
+                    "table": self.table_name,
+                },
+            )
             return False
         except Exception as e:
-            logger.error(f"Unexpected error saving chunk: {e}")
+            logger.exception(
+                "Unexpected error saving chunk to DynamoDB",
+                extra={
+                    "stream_id": stream_id,
+                    "session_id": session_id,
+                    "chunk_id": chunk_id,
+                    "error": str(e),
+                },
+            )
             return False
 
     def _put_item(self, item: dict):
@@ -143,9 +174,26 @@ class DynamoDBClient:
                 start_timestamp,
                 end_timestamp
             )
+            logger.debug(
+                "DynamoDB query returned chunks",
+                extra={
+                    "stream_id": stream_id,
+                    "count": len(items),
+                    "start_timestamp": start_timestamp,
+                    "end_timestamp": end_timestamp,
+                },
+            )
             return items
         except Exception as e:
-            logger.error(f"Failed to query chunks: {e}")
+            logger.exception(
+                "Failed to query chunks from DynamoDB",
+                extra={
+                    "stream_id": stream_id,
+                    "start_timestamp": start_timestamp,
+                    "end_timestamp": end_timestamp,
+                    "error": str(e),
+                },
+            )
             return []
 
     async def check_session_ended(self, room_id: str) -> bool:
@@ -161,13 +209,29 @@ class DynamoDBClient:
         """
         try:
             loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
+            result = await loop.run_in_executor(
                 _executor,
                 self._check_session_ended_sync,
                 room_id
             )
+            if result:
+                logger.debug(
+                    "Session-end entry present in DynamoDB",
+                    extra={
+                        "room_id": room_id,
+                        "table": settings.SESSION_ENDS_TABLE_NAME,
+                    },
+                )
+            return result
         except Exception as e:
-            logger.error(f"Error checking session end for {room_id}: {e}")
+            logger.exception(
+                "Error checking session end",
+                extra={
+                    "room_id": room_id,
+                    "table": settings.SESSION_ENDS_TABLE_NAME,
+                    "error": str(e),
+                },
+            )
             return False
 
     def _check_session_ended_sync(self, room_id: str) -> bool:

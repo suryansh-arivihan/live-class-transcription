@@ -15,7 +15,7 @@ from src.services.aws_transcribe_client import AwsTranscribeClient
 from src.services.stream_manager import stream_manager
 from src.services.dynamodb_client import dynamodb_client
 from src.config import settings
-from src.utils.logger import setup_logger
+from src.utils.logger import setup_logger, set_log_context
 
 logger = setup_logger(__name__)
 
@@ -39,6 +39,7 @@ class TranscriptionService:
         self.stt_client: Optional[Union[SonioxClient, AwsTranscribeClient]] = None
         self._running = False
         self._start_time: Optional[datetime] = None
+        self._active_provider: Optional[str] = None
 
     async def start(self) -> AsyncGenerator[TranscriptionSegment, None]:
         """
@@ -56,8 +57,18 @@ class TranscriptionService:
         """
         self._running = True
         self._start_time = datetime.utcnow()
+        set_log_context(unique_id=self.unique_id)
 
-        logger.info(f"Starting transcription for stream {self.unique_id}")
+        logger.info(
+            "Starting transcription pipeline",
+            extra={
+                "unique_id": self.unique_id,
+                "hls_url": self.hls_url,
+                "language": getattr(self.options, "language", None),
+            },
+        )
+
+        cycle_count = 0
 
         try:
             await stream_manager.update_session_status(
@@ -65,6 +76,15 @@ class TranscriptionService:
             )
 
             while self._running:
+                cycle_count += 1
+                logger.info(
+                    "Starting pipeline cycle",
+                    extra={
+                        "unique_id": self.unique_id,
+                        "cycle": cycle_count,
+                    },
+                )
+
                 # --- Pipeline cycle: fresh components each time ---
                 self.audio_extractor = AudioExtractor(self.hls_url, reconnect_timeout=0)
                 self.stt_client = await self._connect_stt_with_fallback()
@@ -94,8 +114,13 @@ class TranscriptionService:
                     # connection lost, etc.) — don't crash the session,
                     # fall through to WAITING state.
                     logger.warning(
-                        f"Pipeline cycle failed for {self.unique_id}: {e}. "
-                        f"Will poll for session end or stream resume."
+                        "Pipeline cycle failed — will poll for session end or stream resume",
+                        extra={
+                            "unique_id": self.unique_id,
+                            "cycle": cycle_count,
+                            "provider": self._active_provider,
+                            "error": str(e),
+                        },
                     )
                     pipeline_error = True
 
@@ -114,25 +139,42 @@ class TranscriptionService:
                     self.unique_id, StreamStatus.WAITING
                 )
                 logger.info(
-                    f"Stream silent for {self.unique_id}. "
-                    f"Polling for session end or stream resume."
+                    "Stream silent — polling for session end or stream resume",
+                    extra={
+                        "unique_id": self.unique_id,
+                        "cycle": cycle_count,
+                        "pipeline_error": pipeline_error,
+                    },
                 )
 
                 result = await self._wait_for_session_end_or_resume()
 
                 if result == "resumed":
                     logger.info(
-                        f"Stream resumed for {self.unique_id}, restarting pipeline."
+                        "Stream resumed — restarting pipeline",
+                        extra={"unique_id": self.unique_id, "cycle": cycle_count},
                     )
                     continue
                 else:
                     logger.info(
-                        f"Session ended for {self.unique_id} (reason: {result})."
+                        "Session ending",
+                        extra={
+                            "unique_id": self.unique_id,
+                            "cycle": cycle_count,
+                            "reason": result,
+                        },
                     )
                     break
 
         except Exception as e:
-            logger.error(f"Transcription error for stream {self.unique_id}: {e}")
+            logger.exception(
+                "Transcription pipeline error",
+                extra={
+                    "unique_id": self.unique_id,
+                    "cycles_completed": cycle_count,
+                    "error": str(e),
+                },
+            )
             await stream_manager.update_session_status(
                 self.unique_id, StreamStatus.ERROR, str(e)
             )
@@ -164,9 +206,12 @@ class TranscriptionService:
         prev_poll_sequence: Optional[int] = None
 
         logger.info(
-            f"Polling every {poll_interval}s for session end "
-            f"(timeout: {settings.SESSION_END_POLL_TIMEOUT}s) "
-            f"for {self.unique_id}"
+            "Polling for session end or stream resume",
+            extra={
+                "unique_id": self.unique_id,
+                "poll_interval_s": poll_interval,
+                "poll_timeout_s": settings.SESSION_END_POLL_TIMEOUT,
+            },
         )
 
         while self._running and time.monotonic() < deadline:
@@ -174,7 +219,8 @@ class TranscriptionService:
             ended = await dynamodb_client.check_session_ended(self.unique_id)
             if ended:
                 logger.info(
-                    f"Session-end entry found in DynamoDB for {self.unique_id}."
+                    "Session-end entry found in DynamoDB",
+                    extra={"unique_id": self.unique_id},
                 )
                 return "ended"
 
@@ -185,9 +231,12 @@ class TranscriptionService:
                 if not is_final and sequence is not None:
                     if prev_poll_sequence is not None and sequence > prev_poll_sequence:
                         logger.info(
-                            f"Stream resumed for {self.unique_id} — "
-                            f"HLS sequence advancing "
-                            f"({prev_poll_sequence} → {sequence})."
+                            "Stream resumed — HLS sequence advancing",
+                            extra={
+                                "unique_id": self.unique_id,
+                                "prev_sequence": prev_poll_sequence,
+                                "current_sequence": sequence,
+                            },
                         )
                         return "resumed"
                     prev_poll_sequence = sequence
@@ -202,8 +251,11 @@ class TranscriptionService:
             return "stopped"
 
         logger.warning(
-            f"Session-end poll timeout ({settings.SESSION_END_POLL_TIMEOUT}s) "
-            f"exceeded for {self.unique_id}."
+            "Session-end poll timeout exceeded",
+            extra={
+                "unique_id": self.unique_id,
+                "timeout_s": settings.SESSION_END_POLL_TIMEOUT,
+            },
         )
         return "timeout"
 
@@ -215,11 +267,19 @@ class TranscriptionService:
         soniox = SonioxClient()
         try:
             await soniox.connect(self.options)
+            self._active_provider = "soniox"
+            logger.info(
+                "STT provider connected",
+                extra={"unique_id": self.unique_id, "provider": "soniox"},
+            )
             return soniox
         except Exception as e:
             logger.warning(
-                f"Soniox connect failed for {self.unique_id}: {e}. "
-                f"Falling back to AWS Transcribe."
+                "Soniox connect failed — falling back to AWS Transcribe",
+                extra={
+                    "unique_id": self.unique_id,
+                    "soniox_error": str(e),
+                },
             )
             try:
                 await soniox.disconnect()
@@ -228,13 +288,27 @@ class TranscriptionService:
 
             aws = AwsTranscribeClient()
             await aws.connect(self.options)
-            logger.info(f"Using AWS Transcribe fallback for {self.unique_id}")
+            self._active_provider = "aws_transcribe"
+            logger.info(
+                "STT provider connected (fallback)",
+                extra={
+                    "unique_id": self.unique_id,
+                    "provider": "aws_transcribe",
+                    "region": aws.region,
+                },
+            )
             return aws
 
     async def _stream_audio(self):
         """Stream audio from HLS to the active STT client."""
         try:
-            logger.info(f"Starting audio streaming for {self.unique_id}")
+            logger.info(
+                "Starting audio streaming",
+                extra={
+                    "unique_id": self.unique_id,
+                    "provider": self._active_provider,
+                },
+            )
             async for audio_chunk in self.audio_extractor.start():
                 if not self._running:
                     break
@@ -242,16 +316,36 @@ class TranscriptionService:
 
             # Send end-of-stream signal
             await self.stt_client.send_eos()
-            logger.info(f"Audio streaming completed for {self.unique_id}")
+            logger.info(
+                "Audio streaming completed",
+                extra={
+                    "unique_id": self.unique_id,
+                    "provider": self._active_provider,
+                },
+            )
 
         except Exception as e:
-            logger.error(f"Audio streaming error: {e}")
+            logger.exception(
+                "Audio streaming error",
+                extra={
+                    "unique_id": self.unique_id,
+                    "provider": self._active_provider,
+                    "error": str(e),
+                },
+            )
             raise
 
     async def _receive_transcriptions(self) -> AsyncGenerator[TranscriptionSegment, None]:
         """Receive and format transcriptions from the active STT client."""
         try:
-            logger.info(f"Starting transcription reception for {self.unique_id}")
+            logger.info(
+                "Starting transcription reception",
+                extra={
+                    "unique_id": self.unique_id,
+                    "provider": self._active_provider,
+                },
+            )
+            received_count = 0
 
             async for result in self.stt_client.receive_transcriptions():
                 if not self._running:
@@ -259,12 +353,27 @@ class TranscriptionService:
 
                 segment = self._format_transcription(result)
                 if segment:
+                    received_count += 1
                     yield segment
 
-            logger.info(f"Transcription reception completed for {self.unique_id}")
+            logger.info(
+                "Transcription reception completed",
+                extra={
+                    "unique_id": self.unique_id,
+                    "provider": self._active_provider,
+                    "segments_received": received_count,
+                },
+            )
 
         except Exception as e:
-            logger.error(f"Transcription reception error: {e}")
+            logger.exception(
+                "Transcription reception error",
+                extra={
+                    "unique_id": self.unique_id,
+                    "provider": self._active_provider,
+                    "error": str(e),
+                },
+            )
             raise
 
     def _format_transcription(self, result: dict) -> Optional[TranscriptionSegment]:
@@ -324,7 +433,13 @@ class TranscriptionService:
 
     async def stop(self):
         """Stop transcription pipeline."""
-        logger.info(f"Stopping transcription for stream {self.unique_id}")
+        logger.info(
+            "Stopping transcription pipeline",
+            extra={
+                "unique_id": self.unique_id,
+                "provider": self._active_provider,
+            },
+        )
         self._running = False
 
         if self.audio_extractor:
@@ -337,4 +452,7 @@ class TranscriptionService:
             self.unique_id, StreamStatus.STOPPED
         )
 
-        logger.info(f"Transcription stopped for stream {self.unique_id}")
+        logger.info(
+            "Transcription pipeline stopped",
+            extra={"unique_id": self.unique_id},
+        )

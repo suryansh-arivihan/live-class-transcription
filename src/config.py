@@ -55,6 +55,13 @@ class Settings(BaseSettings):
 
     # Logging
     LOG_LEVEL: str = "INFO"
+    LOG_FORMAT: str = "json"  # "json" for structured (production), "text" for plain (local dev)
+
+    # CloudWatch Logging
+    CLOUDWATCH_ENABLED: bool = False
+    CLOUDWATCH_LOG_GROUP: str = "/app/transcription-service"
+    CLOUDWATCH_LOG_STREAM: Optional[str] = None  # Auto-generated from hostname if None
+    CLOUDWATCH_REGION: Optional[str] = None  # Falls back to AWS_REGION if None
 
     class Config:
         env_file = ".env"

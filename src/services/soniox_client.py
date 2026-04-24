@@ -25,6 +25,8 @@ class SonioxClient:
         self.websocket: Optional[websockets.WebSocketClientProtocol] = None
         self._connected = False
         self._buffered_message: Optional[str] = None
+        self._audio_bytes_sent = 0
+        self._messages_received = 0
 
     async def connect(self, options: StreamOptions):
         """
@@ -37,7 +39,14 @@ class SonioxClient:
             ConnectionError: If connection fails
         """
         try:
-            logger.info(f"Connecting to Soniox at {self.ws_url}")
+            logger.info(
+                "Connecting to Soniox",
+                extra={
+                    "ws_url": self.ws_url,
+                    "model": settings.SONIOX_MODEL,
+                    "sample_rate": settings.SONIOX_SAMPLE_RATE,
+                },
+            )
 
             # Connect to WebSocket
             self.websocket = await websockets.connect(
@@ -86,10 +95,20 @@ class SonioxClient:
             await self._verify_config_accepted()
 
             self._connected = True
-            logger.info("Connected to Soniox WebSocket successfully")
+            logger.info(
+                "Connected to Soniox WebSocket",
+                extra={
+                    "model": settings.SONIOX_MODEL,
+                    "language_hints": options.language_hints,
+                    "speaker_diarization": options.enable_speaker_diarization,
+                },
+            )
 
         except Exception as e:
-            logger.error(f"Failed to connect to Soniox: {e}")
+            logger.error(
+                "Failed to connect to Soniox",
+                extra={"ws_url": self.ws_url, "error": str(e)},
+            )
             self._connected = False
             raise ConnectionError(f"Failed to connect to Soniox: {e}")
 
@@ -115,6 +134,13 @@ class SonioxClient:
             return
 
         if data.get("error_code"):
+            logger.warning(
+                "Soniox rejected config",
+                extra={
+                    "error_code": data.get("error_code"),
+                    "error_message": data.get("error_message"),
+                },
+            )
             raise RuntimeError(
                 f"Soniox rejected config: {data.get('error_code')} - "
                 f"{data.get('error_message')}"
@@ -137,8 +163,16 @@ class SonioxClient:
 
         try:
             await self.websocket.send(audio_chunk)
+            self._audio_bytes_sent += len(audio_chunk)
         except Exception as e:
-            logger.error(f"Error sending audio chunk: {e}")
+            logger.exception(
+                "Error sending audio chunk to Soniox",
+                extra={
+                    "chunk_size": len(audio_chunk),
+                    "total_bytes_sent": self._audio_bytes_sent,
+                    "error": str(e),
+                },
+            )
             raise
 
     async def send_eos(self):
@@ -147,9 +181,15 @@ class SonioxClient:
             try:
                 # Empty string signals end-of-audio
                 await self.websocket.send("")
-                logger.info("Sent end-of-stream signal")
+                logger.info(
+                    "End-of-stream signal sent to Soniox",
+                    extra={"total_bytes_sent": self._audio_bytes_sent},
+                )
             except Exception as e:
-                logger.error(f"Error sending EOS: {e}")
+                logger.exception(
+                    "Error sending EOS to Soniox",
+                    extra={"error": str(e)},
+                )
 
     async def receive_transcriptions(self) -> AsyncGenerator[Dict[str, Any], None]:
         """
@@ -164,7 +204,7 @@ class SonioxClient:
         if not self._connected or not self.websocket:
             raise RuntimeError("WebSocket not connected")
 
-        logger.info("Starting to receive transcriptions")
+        logger.info("Starting to receive Soniox transcriptions")
 
         async def _stream():
             if self._buffered_message is not None:
@@ -177,15 +217,25 @@ class SonioxClient:
             async for message in _stream():
                 try:
                     data = json.loads(message)
+                    self._messages_received += 1
 
                     # Check for errors
                     if data.get("error_code"):
-                        logger.error(f"Soniox error: {data.get('error_code')} - {data.get('error_message')}")
+                        logger.error(
+                            "Soniox API error",
+                            extra={
+                                "error_code": data.get("error_code"),
+                                "error_message": data.get("error_message"),
+                            },
+                        )
                         raise RuntimeError(f"Soniox API error: {data.get('error_message')}")
 
                     # Check for finished signal
                     if data.get("finished"):
-                        logger.info("Transcription session finished")
+                        logger.info(
+                            "Soniox transcription session finished",
+                            extra={"messages_received": self._messages_received},
+                        )
                         break
 
                     # Yield transcription data if it contains tokens
@@ -193,13 +243,29 @@ class SonioxClient:
                         yield data
 
                 except json.JSONDecodeError as e:
-                    logger.error(f"Failed to parse Soniox response: {e}")
+                    logger.error(
+                        "Failed to parse Soniox response",
+                        extra={"error": str(e)},
+                    )
                     continue
 
-        except websockets.exceptions.ConnectionClosed:
-            logger.info("Soniox WebSocket connection closed")
+        except websockets.exceptions.ConnectionClosed as e:
+            logger.info(
+                "Soniox WebSocket connection closed",
+                extra={
+                    "code": getattr(e, "code", None),
+                    "reason": getattr(e, "reason", None),
+                    "messages_received": self._messages_received,
+                },
+            )
         except Exception as e:
-            logger.error(f"Error receiving transcriptions: {e}")
+            logger.exception(
+                "Error receiving transcriptions from Soniox",
+                extra={
+                    "messages_received": self._messages_received,
+                    "error": str(e),
+                },
+            )
             raise
 
     async def disconnect(self):
@@ -208,9 +274,18 @@ class SonioxClient:
             try:
                 await self.send_eos()
                 await self.websocket.close()
-                logger.info("Disconnected from Soniox")
+                logger.info(
+                    "Disconnected from Soniox",
+                    extra={
+                        "total_bytes_sent": self._audio_bytes_sent,
+                        "messages_received": self._messages_received,
+                    },
+                )
             except Exception as e:
-                logger.error(f"Error during disconnect: {e}")
+                logger.exception(
+                    "Error during Soniox disconnect",
+                    extra={"error": str(e)},
+                )
             finally:
                 self.websocket = None
                 self._connected = False

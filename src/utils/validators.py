@@ -20,7 +20,10 @@ def validate_unique_id(unique_id: str) -> bool:
     # Allow alphanumeric characters, hyphens, and underscores
     pattern = r'^[a-zA-Z0-9_-]+$'
     if not re.match(pattern, unique_id):
-        logger.warning(f"Invalid unique_id format: {unique_id}")
+        logger.warning(
+            "Invalid unique_id format",
+            extra={"unique_id": unique_id},
+        )
         return False
     return True
 
@@ -57,30 +60,54 @@ async def validate_stream_availability(hls_url: str) -> bool:
             try:
                 async with session.head(hls_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                     if response.status == 200:
-                        logger.info(f"Stream available at {hls_url} (HEAD)")
+                        logger.info(
+                            "Stream available (HEAD)",
+                            extra={"hls_url": hls_url, "method": "HEAD"},
+                        )
                         return True
                     elif response.status == 405:
                         # Method not allowed, try GET
-                        logger.info(f"HEAD not supported, trying GET for {hls_url}")
+                        logger.debug(
+                            "HEAD not supported, trying GET",
+                            extra={"hls_url": hls_url, "http_status": response.status},
+                        )
                     else:
-                        logger.warning(f"HEAD request failed with status {response.status}")
+                        logger.warning(
+                            "HEAD request returned non-200",
+                            extra={"hls_url": hls_url, "http_status": response.status},
+                        )
             except Exception as e:
-                logger.warning(f"HEAD request failed: {e}, trying GET")
+                logger.debug(
+                    "HEAD request failed — falling back to GET",
+                    extra={"hls_url": hls_url, "error": str(e)},
+                )
 
             # Fallback to GET request
             async with session.get(hls_url, timeout=aiohttp.ClientTimeout(total=10)) as response:
                 if response.status == 200:
-                    logger.info(f"Stream available at {hls_url} (GET)")
+                    logger.info(
+                        "Stream available (GET)",
+                        extra={"hls_url": hls_url, "method": "GET"},
+                    )
                     return True
                 else:
-                    logger.warning(f"Stream not available at {hls_url}, status: {response.status}")
+                    logger.warning(
+                        "Stream not available",
+                        extra={"hls_url": hls_url, "http_status": response.status},
+                    )
                     return False
 
     except aiohttp.ClientError as e:
-        logger.error(f"Error checking stream availability: {e}")
+        logger.error(
+            "Error checking stream availability (ClientError)",
+            extra={"hls_url": hls_url, "error": str(e)},
+        )
         return False
     except Exception as e:
-        logger.error(f"Unexpected error checking stream: {e}")
+        logger.exception(
+            "Unexpected error checking stream availability",
+            extra={"hls_url": hls_url, "error": str(e)},
+        )
         return False
 
 
@@ -100,7 +127,10 @@ def validate_vocabulary(vocabulary: list) -> bool:
     # Check each term is a non-empty string
     for term in vocabulary:
         if not isinstance(term, str) or not term.strip():
-            logger.warning(f"Invalid vocabulary term: {term}")
+            logger.warning(
+                "Invalid vocabulary term",
+                extra={"term": term},
+            )
             return False
 
     return True

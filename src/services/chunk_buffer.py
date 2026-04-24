@@ -51,12 +51,21 @@ class ChunkBuffer:
         self._lock = asyncio.Lock()
         self._flush_task: Optional[asyncio.Task] = None
         self._running = False
+        self._total_flushes = 0
+        self._total_segments_buffered = 0
 
     async def start(self):
         """Start the chunk buffer and periodic flush task."""
         self._running = True
         self._flush_task = asyncio.create_task(self._periodic_flush())
-        logger.info(f"Chunk buffer started for stream {self.stream_id}")
+        logger.info(
+            "Chunk buffer started",
+            extra={
+                "stream_id": self.stream_id,
+                "session_id": self.session_id,
+                "chunk_duration_s": self.chunk_duration,
+            },
+        )
 
     async def stop(self):
         """Stop the chunk buffer and flush remaining data."""
@@ -70,7 +79,14 @@ class ChunkBuffer:
 
         # Flush any remaining data
         await self._flush_current_chunk()
-        logger.info(f"Chunk buffer stopped for stream {self.stream_id}")
+        logger.info(
+            "Chunk buffer stopped",
+            extra={
+                "stream_id": self.stream_id,
+                "total_flushes": self._total_flushes,
+                "total_segments_buffered": self._total_segments_buffered,
+            },
+        )
 
     async def add_segment(self, segment: TranscriptionSegment):
         """
@@ -93,6 +109,7 @@ class ChunkBuffer:
             # Add segment to current chunk
             self._current_chunk.segments.append(segment)
             self._current_chunk.end_time = segment.stream_time
+            self._total_segments_buffered += 1
 
             # Update aggregated text (use final text or latest partial)
             if segment.is_final:
@@ -124,7 +141,10 @@ class ChunkBuffer:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in periodic flush: {e}")
+                logger.exception(
+                    "Error in periodic flush",
+                    extra={"stream_id": self.stream_id, "error": str(e)},
+                )
 
     async def _flush_current_chunk(self):
         """Flush the current chunk to the callback."""
@@ -154,9 +174,28 @@ class ChunkBuffer:
         if self.on_chunk_ready and chunk.text:
             try:
                 await self.on_chunk_ready(self.stream_id, self.session_id, chunk)
-                logger.debug(f"Flushed chunk for stream {self.stream_id}: {chunk.text[:50]}...")
+                self._total_flushes += 1
+                logger.debug(
+                    "Chunk flushed",
+                    extra={
+                        "stream_id": self.stream_id,
+                        "session_id": self.session_id,
+                        "flush_count": self._total_flushes,
+                        "chunk_start": chunk.start_time,
+                        "chunk_end": chunk.end_time,
+                        "word_count": len(chunk.words),
+                        "text_preview": chunk.text[:50] if chunk.text else "",
+                    },
+                )
             except Exception as e:
-                logger.error(f"Error in chunk callback: {e}")
+                logger.exception(
+                    "Error in chunk callback",
+                    extra={
+                        "stream_id": self.stream_id,
+                        "session_id": self.session_id,
+                        "error": str(e),
+                    },
+                )
 
 
 class ChunkBufferManager:
@@ -186,6 +225,10 @@ class ChunkBufferManager:
         async with self._lock:
             if stream_id in self._buffers:
                 # Stop existing buffer
+                logger.info(
+                    "Replacing existing chunk buffer",
+                    extra={"stream_id": stream_id, "session_id": session_id},
+                )
                 await self._buffers[stream_id].stop()
 
             buffer = ChunkBuffer(
@@ -195,6 +238,14 @@ class ChunkBufferManager:
             )
             await buffer.start()
             self._buffers[stream_id] = buffer
+            logger.info(
+                "Chunk buffer created",
+                extra={
+                    "stream_id": stream_id,
+                    "session_id": session_id,
+                    "total_buffers": len(self._buffers),
+                },
+            )
             return buffer
 
     async def get_buffer(self, stream_id: str) -> Optional[ChunkBuffer]:
@@ -208,7 +259,13 @@ class ChunkBufferManager:
             if stream_id in self._buffers:
                 await self._buffers[stream_id].stop()
                 del self._buffers[stream_id]
-                logger.info(f"Removed chunk buffer for stream {stream_id}")
+                logger.info(
+                    "Removed chunk buffer",
+                    extra={
+                        "stream_id": stream_id,
+                        "remaining_buffers": len(self._buffers),
+                    },
+                )
 
 
 # Global instance
