@@ -57,6 +57,23 @@ class TranscriptionStopRequest(BaseModel):
     unique_id: str
 
 
+class HeartbeatRequest(BaseModel):
+    """Request model for the FE heartbeat / polling endpoint."""
+    unique_id: str
+    options: Optional[StreamOptions] = None
+
+
+class HeartbeatResponse(BaseModel):
+    """Response model for the heartbeat endpoint."""
+    unique_id: str
+    session_id: str
+    transcription_active: bool  # Always True after a successful call
+    created_now: bool  # True if this call created a fresh session
+    stream_available: bool  # Whether the HLS stream was reachable at this poll
+    uptime_seconds: Optional[float] = None
+    stream_url: Optional[str] = None
+
+
 class HealthResponse(BaseModel):
     """Response model for health check endpoint."""
     status: str

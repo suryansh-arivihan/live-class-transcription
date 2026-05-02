@@ -63,6 +63,10 @@ class Settings(BaseSettings):
     CLOUDWATCH_LOG_STREAM: Optional[str] = None  # Auto-generated from hostname if None
     CLOUDWATCH_REGION: Optional[str] = None  # Falls back to AWS_REGION if None
 
+    # Slack Alerts
+    SLACK_WEBHOOK_URL: Optional[str] = None  # Incoming webhook URL; alerts disabled when unset
+    SLACK_ALERT_COOLDOWN_SECONDS: int = 600  # Min interval between alerts for the same unique_id
+
     class Config:
         env_file = ".env"
         case_sensitive = True
